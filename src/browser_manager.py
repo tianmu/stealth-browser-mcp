@@ -219,11 +219,29 @@ class BrowserManager:
                 except Exception:
                     pass
 
+                process_killed = False
                 try:
-                    process_cleanup.kill_browser_process(instance_id)
+                    process_killed = process_cleanup.kill_browser_process(instance_id)
                 except Exception as e:
                     debug_logger.log_warning("browser_manager", "close_instance", 
                                            f"Process cleanup failed for {instance_id}: {e}")
+
+                if not process_killed:
+                    try:
+                        fallback_pid = None
+                        if hasattr(browser, '_process') and browser._process and getattr(browser._process, 'pid', None):
+                            fallback_pid = browser._process.pid
+                        elif hasattr(browser, '_process_pid') and browser._process_pid:
+                            fallback_pid = browser._process_pid
+
+                        if fallback_pid:
+                            process_cleanup.kill_process_tree_by_pid(fallback_pid, instance_id)
+                    except Exception as e:
+                        debug_logger.log_warning(
+                            "browser_manager",
+                            "close_instance",
+                            f"Fallback process tree cleanup failed for {instance_id}: {e}"
+                        )
 
                 try:
                     await browser.stop()
