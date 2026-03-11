@@ -153,6 +153,64 @@ class ProcessCleanup:
             self.untrack_browser_process(instance_id)
         
         return success
+
+    def kill_process_tree_by_pid(self, pid: int, instance_id: str = "unknown") -> bool:
+        """Kill a process tree by PID.
+
+        Args:
+            pid: Root process ID
+            instance_id: Instance identifier for logging
+
+        Returns:
+            bool: True if process tree terminated successfully or already exited
+        """
+        return self._kill_process_by_pid(pid, instance_id)
+
+    @staticmethod
+    def _is_likely_browser_process(proc_name: str) -> bool:
+        """Best-effort browser process name check."""
+        normalized = proc_name.lower()
+        return any(name in normalized for name in [
+            'chrome',
+            'chromium',
+            'msedge',
+            'edge',
+            'headless_shell'
+        ])
+
+    def _collect_process_tree(self, root_proc: psutil.Process) -> List[psutil.Process]:
+        """Collect root process and descendants (children first order)."""
+        descendants = root_proc.children(recursive=True)
+        descendants.append(root_proc)
+        return descendants
+
+    def _terminate_processes(self, processes: List[psutil.Process], timeout: float = 3.0) -> Set[int]:
+        """Send terminate signal and return PIDs that survived."""
+        for proc in processes:
+            try:
+                proc.terminate()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as e:
+                debug_logger.log_warning("process_cleanup", "terminate_process", f"Failed to terminate PID {proc.pid}: {e}")
+
+        gone, alive = psutil.wait_procs(processes, timeout=timeout)
+        _ = gone
+        return {proc.pid for proc in alive}
+
+    def _kill_processes(self, processes: List[psutil.Process], timeout: float = 2.0) -> Set[int]:
+        """Send kill signal and return PIDs that survived."""
+        for proc in processes:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as e:
+                debug_logger.log_warning("process_cleanup", "kill_process", f"Failed to kill PID {proc.pid}: {e}")
+
+        gone, alive = psutil.wait_procs(processes, timeout=timeout)
+        _ = gone
+        return {proc.pid for proc in alive}
     
     def _kill_process_by_pid(self, pid: int, instance_id: str = "unknown") -> bool:
         """Kill a process by PID using multiple methods.
@@ -171,14 +229,14 @@ class ProcessCleanup:
                 return True
             
             try:
-                proc = psutil.Process(pid)
-                proc_name = proc.name()
-                
-                if not any(name in proc_name.lower() for name in ['chrome', 'chromium', 'msedge']):
+                root_proc = psutil.Process(pid)
+                proc_name = root_proc.name()
+
+                if not self._is_likely_browser_process(proc_name):
                     debug_logger.log_warning("process_cleanup", "kill_process", 
                                            f"PID {pid} is not a browser process ({proc_name}), skipping")
                     return False
-                    
+
             except psutil.NoSuchProcess:
                 debug_logger.log_info("process_cleanup", "kill_process", 
                                     f"Process {pid} for {instance_id} no longer exists")
@@ -186,45 +244,38 @@ class ProcessCleanup:
             except Exception as e:
                 debug_logger.log_warning("process_cleanup", "kill_process", 
                                        f"Could not verify process {pid}: {e}")
-            
+
             try:
-                proc = psutil.Process(pid)
-                proc.terminate()
-                
-                try:
-                    proc.wait(timeout=3)
-                    debug_logger.log_info("process_cleanup", "kill_process", 
-                                        f"Process {pid} for {instance_id} terminated gracefully")
-                    return True
-                except psutil.TimeoutExpired:
-                    pass
-                    
+                processes = self._collect_process_tree(root_proc)
             except psutil.NoSuchProcess:
                 return True
             except Exception as e:
-                debug_logger.log_warning("process_cleanup", "kill_process", 
-                                       f"Failed to terminate process {pid} gracefully: {e}")
-            
-            try:
-                proc = psutil.Process(pid)
-                proc.kill()
-                
-                try:
-                    proc.wait(timeout=2)
-                    debug_logger.log_info("process_cleanup", "kill_process", 
-                                        f"Process {pid} for {instance_id} force killed")
-                    return True
-                except psutil.TimeoutExpired:
-                    debug_logger.log_error("process_cleanup", "kill_process", 
-                                         f"Process {pid} for {instance_id} did not die after force kill")
-                    return False
-                    
-            except psutil.NoSuchProcess:
+                debug_logger.log_warning("process_cleanup", "kill_process", f"Failed to inspect process tree for {pid}: {e}")
+                processes = [root_proc]
+
+            alive_after_terminate = self._terminate_processes(processes, timeout=3.0)
+            if not alive_after_terminate:
+                debug_logger.log_info("process_cleanup", "kill_process", 
+                                    f"Process tree for {pid} ({instance_id}) terminated gracefully")
                 return True
-            except Exception as e:
-                debug_logger.log_error("process_cleanup", "kill_process", 
-                                     f"Failed to force kill process {pid}: {e}")
-                return False
+
+            remaining = []
+            for proc in processes:
+                if proc.pid in alive_after_terminate:
+                    remaining.append(proc)
+
+            alive_after_kill = self._kill_processes(remaining, timeout=2.0)
+            if not alive_after_kill:
+                debug_logger.log_info("process_cleanup", "kill_process", 
+                                    f"Process tree for {pid} ({instance_id}) force killed")
+                return True
+
+            debug_logger.log_error(
+                "process_cleanup",
+                "kill_process",
+                f"Process tree for {pid} ({instance_id}) still alive after force kill: {sorted(alive_after_kill)}"
+            )
+            return False
                 
         except Exception as e:
             debug_logger.log_error("process_cleanup", "kill_process", 
